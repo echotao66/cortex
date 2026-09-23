@@ -1,0 +1,52 @@
+# 两个服务：cortex 本身 + Caddy 反代（顺带做 Basic 鉴权）。
+#
+# 为什么不让 cortex 自己占公网端口：
+#   1. 鉴权用 Caddyfile 声明式配置，不用往应用代码里塞认证逻辑；
+#   2. 以后上域名 + HTTPS 只需改 Caddyfile 加一行 tls，应用侧零改动；
+#   3. cortex 端口不 publish，公网上根本连不到它，少一层暴露面。
+#
+# 用法：
+#   cp .env.example .env   # 填 DEEPSEEK_API_KEY
+#   docker compose up -d --build
+services:
+  cortex:
+    build: .
+    restart: unless-stopped
+    environment:
+      # ":?" 是故意的：没配 key 就直接报错退出，而不是起一个聊不了天的服务
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?请在 .env 里设置 DEEPSEEK_API_KEY}
+      CORTEX_MEMORY_STORE: ${CORTEX_MEMORY_STORE:-chroma}
+      # 内置工具的 workspace_root 与 MCP 子进程的沙箱根，两者必须一致
+      MCP_FS_ROOT: /app/cortex
+    volumes:
+      # 记忆落盘在宿主机上，容器重建/换镜像都不丢。
+      # 注意：容器内是 uid 10001，宿主机上这个目录要 chown 10001:10001，
+      # 否则写盘会失败——而且是静默降级，日志里只有一行警告。
+      - ./data:/app/cortex/.cortex
+    expose:
+      - "8000"          # 只在 compose 内部网络可达，不发布到公网
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s   # chroma 首次打开要建库，给足冷启动时间
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${CORTEX_PORT:-8000}:8000"
+    environment:
+      # 从 .env 读，Caddyfile 用 {$...} 引用——这样 Caddyfile 本身可以提交进 git，
+      # 凭据只留在 .env 里（已 gitignore）。
+      CORTEX_AUTH_USER: ${CORTEX_AUTH_USER:?请在 .env 里设置 CORTEX_AUTH_USER}
+      CORTEX_AUTH_HASH: ${CORTEX_AUTH_HASH:?请在 .env 里设置 CORTEX_AUTH_HASH（用 caddy hash-password 生成）}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data          # 以后加 HTTPS 时证书存这里
+    depends_on:
+      - cortex
+
+volumes:
+  caddy-data:

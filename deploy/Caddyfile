@@ -1,0 +1,36 @@
+# Caddy 反代 + HTTP Basic 鉴权。
+#
+# 改完这个文件后执行 `docker compose restart caddy` 生效（配置是挂载进去的）。
+
+# 现在没有域名，直接监听容器内的 8000；compose 把宿主机端口映射到这里。
+:8000 {
+	# 指令名注意版本：Caddy 2.8 起从 basicauth 改名为 basic_auth
+	#（旧名还能用但会打 deprecation 警告）。caddy:2-alpine 是 2.8+。
+	#
+	# 用户名和密码哈希由 compose 从 .env 注入（{$VAR} 在解析前做一次文本替换），
+	# 所以这个文件不含任何凭据，可以安全提交进 git。
+	# 生成哈希：
+	#   docker run --rm caddy:2-alpine caddy hash-password --plaintext '你的密码'
+	# 整串（含 $）填到服务器 .env 的 CORTEX_AUTH_HASH。
+	#
+	# 别把哈希直接写在这里或 docker-compose.yml 里：后者会把 $2a 当变量插值。
+	basic_auth {
+		{$CORTEX_AUTH_USER} {$CORTEX_AUTH_HASH}
+	}
+
+	reverse_proxy cortex:8000 {
+		# 关键一行：关掉反代的响应缓冲。
+		# 不写的话 Caddy 会攒着响应再一次性发出去，SSE 的「逐事件推送」
+		# 在浏览器上就变成「整段回答一次性蹦出来」——页面看着还正常，
+		# 但整个透明/流式的卖点没了，而且很难意识到是这个配置的问题。
+		flush_interval -1
+	}
+}
+
+# 以后买到域名（国内服务器还需 ICP 备案）时，把上面那行换成：
+#   cortex.example.com {
+#       basic_auth { ... }
+#       reverse_proxy cortex:8000 { flush_interval -1 }
+#   }
+# 并把 compose 里的端口映射改成 "80:80" / "443:443"。
+# Caddy 会自动申请并续期 Let's Encrypt 证书，应用代码一行都不用改。

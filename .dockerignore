@@ -1,0 +1,32 @@
+# 构建上下文里不该出现的东西。
+#
+# .env 是这里最重要的一行：密钥根本不进镜像，容器里靠 compose 注入的
+# 环境变量拿。就算 read_file 的黑名单哪天被人改坏了，镜像里也没有这份文件。
+.env
+.cortex/
+.cortex-cli/
+data/
+
+# 虚拟环境与缓存：Linux 镜像里用不上 Windows 的 .venv，还很大
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 版本控制与 IDE
+.git/
+.gitignore
+.idea/
+
+# 演示/迁移的临时产物
+*.json.bak
+demo_result.txt
+mcp_smoke.txt
+
+# 部署文档不需要进镜像
+DEPLOY.md
+docker-compose.yml
+Dockerfile
+.dockerignore

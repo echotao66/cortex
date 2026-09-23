@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cortex · 透明 AI 助手</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #181b24;
+      --panel-2: #1f2330;
+      --border: #2a2f3d;
+      --text: #e6e8ee;
+      --muted: #8a92a6;
+      --accent: #6c8cff;
+      --ok: #4ade80;
+      --err: #f87171;
+      --memory: #c084fc;
+      --tool: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      flex: none;
+    }
+    header h1 { margin: 0; font-size: 20px; color: var(--accent); }
+    header span { color: var(--muted); font-size: 13px; }
+
+    main.grid {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 300px 1fr 320px;
+      gap: 12px;
+      padding: 12px;
+    }
+    .col {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .col h2 {
+      margin: 0;
+      padding: 12px 16px;
+      font-size: 14px;
+      border-bottom: 1px solid var(--border);
+      color: var(--muted);
+      flex: none;
+    }
+    .col .scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .card {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    .card .tag {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .5px;
+      margin-bottom: 4px;
+    }
+    .tag.memory { color: var(--memory); }
+    .tag.tool { color: var(--tool); }
+    .tag.ok { color: var(--ok); }
+    .tag.err { color: var(--err); }
+
+    .msg { padding: 10px 14px; border-radius: 10px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+    .msg.user { background: #26304a; align-self: flex-end; max-width: 85%; }
+    .msg.assistant { background: var(--panel-2); border: 1px solid var(--border); align-self: flex-start; max-width: 85%; }
+    .msg.error { background: #3a1f24; border: 1px solid var(--err); color: var(--err); }
+
+    .score { color: var(--muted); font-size: 11px; }
+    .mono { font-family: Consolas, monospace; font-size: 12px; }
+    .empty { color: var(--muted); font-size: 12px; text-align: center; padding: 20px 0; }
+
+    footer {
+      flex: none;
+      display: flex;
+      gap: 10px;
+      padding: 12px 20px;
+      border-top: 1px solid var(--border);
+    }
+    footer input {
+      flex: 1;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 10px 14px;
+      font-size: 14px;
+      outline: none;
+    }
+    footer input:focus { border-color: var(--accent); }
+    footer button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 0 22px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    footer button:disabled { opacity: .5; cursor: not-allowed; }
+
+    @media (max-width: 900px) {
+      main.grid { grid-template-columns: 1fr; overflow-y: auto; }
+      .col { min-height: 240px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Cortex</h1>
+    <span>透明 AI 助手 —— 左看记忆、中看对话、右看工具</span>
+  </header>
+
+  <main class="grid">
+    <aside class="col">
+      <h2>🧠 记忆</h2>
+      <div class="scroll" id="memory"></div>
+    </aside>
+    <section class="col">
+      <h2>💬 对话</h2>
+      <div class="scroll" id="chat"></div>
+    </section>
+    <aside class="col">
+      <h2>🔧 工具</h2>
+      <div class="scroll" id="tool"></div>
+    </aside>
+  </main>
+
+  <footer>
+    <input id="msg" placeholder="输入消息，回车发送…（试试：计算 123*456，或告诉我你的喜好）" />
+    <button id="send">发送</button>
+  </footer>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+    function card(html, tagClass) {
+      const d = document.createElement("div");
+      d.className = "card";
+      d.innerHTML = `<div class="tag ${tagClass}"></div>` + html;
+      return d;
+    }
+
+    let currentTool = null; // 串行执行：一个 tool_called 紧跟一个 tool_result
+    let currentAnswer = null; // 流式输出中的助手气泡
+
+    function handle(evt) {
+      const t = evt.type, p = evt.payload || {};
+      if (t === "memory_recalled") {
+        const html = p.items.map((i) =>
+          `<div>· ${esc(i.text)} <span class="score">(${i.score})</span></div>`).join("");
+        $("memory").appendChild(card(html, "memory"));
+      } else if (t === "fact_extracted") {
+        const facts = (p.facts || []).map((f) =>
+          `<div>· ${esc(f.subject)} ${esc(f.predicate)} ${esc(f.object)}</div>`).join("");
+        const summary = p.summary ? `<div class="score">${esc(p.summary)}</div>` : "";
+        if (facts || summary) $("memory").appendChild(card(facts + summary, "memory"));
+      } else if (t === "tool_called") {
+        currentTool = card(
+          `<div class="mono">${esc(p.name)}(<br>${esc(JSON.stringify(p.arguments, null, 1))})</div>
+           <div class="score">执行中…</div>`, "tool");
+        $("tool").appendChild(currentTool);
+      } else if (t === "tool_result") {
+        if (currentTool) {
+          const ok = p.success;
+          currentTool.querySelector(".tag").className = "tag " + (ok ? "ok" : "err");
+          currentTool.querySelector(".score").textContent =
+            (ok ? "✓ " : "✗ ") + esc(p.output || "");
+        }
+        currentTool = null;
+      } else if (t === "answer_delta") {
+        if (!currentAnswer) {
+          currentAnswer = document.createElement("div");
+          currentAnswer.className = "msg assistant";
+          $("chat").appendChild(currentAnswer);
+        }
+        currentAnswer.textContent += p.delta;
+      } else if (t === "final_answer") {
+        if (currentAnswer) {
+          currentAnswer = null; // 流式已填充，收尾即可
+        } else {
+          const d = document.createElement("div");
+          d.className = "msg assistant";
+          d.textContent = p.answer;
+          $("chat").appendChild(d);
+        }
+      } else if (t === "error") {
+        const d = document.createElement("div");
+        d.className = "msg error";
+        d.textContent = "⚠ " + p.message;
+        $("chat").appendChild(d);
+      }
+      // 各列自动滚到底
+      [ $("chat"), $("memory"), $("tool") ].forEach((el) => { el.scrollTop = el.scrollHeight; });
+    }
+
+    // 每个标签页一条会话 id，随请求带给后端，用于隔离短期记忆。
+    // 用 sessionStorage 而不是 localStorage：localStorage 会让同一浏览器的
+    // 多个标签页共用一条会话，两边互相覆盖上下文。
+    function newSessionId() {
+      // 注意：crypto.randomUUID 只在「安全上下文」（https 或 localhost）里存在。
+      // 部署后是 http://公网IP，这里会取到 undefined，所以必须有回退分支。
+      if (window.crypto && typeof crypto.randomUUID === "function") {
+        return crypto.randomUUID();
+      }
+      return "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+    }
+    const SESSION_ID = sessionStorage.getItem("cortex_sid") || newSessionId();
+    sessionStorage.setItem("cortex_sid", SESSION_ID);
+
+    function send() {
+      const input = $("msg");
+      const msg = input.value.trim();
+      if (!msg) return;
+
+      const d = document.createElement("div");
+      d.className = "msg user";
+      d.textContent = msg;
+      $("chat").appendChild(d);
+      input.value = "";
+      $("send").disabled = true;
+      currentAnswer = null; // 新消息开始时重置流式气泡
+
+      const url = "/api/chat/stream?message=" + encodeURIComponent(msg)
+                + "&session_id=" + encodeURIComponent(SESSION_ID);
+      const es = new EventSource(url);
+      es.onmessage = (e) => {
+        const evt = JSON.parse(e.data);
+        handle(evt);
+        if (evt.type === "done" || evt.type === "error") {
+          es.close();
+          $("send").disabled = false;
+          $("msg").focus();
+        }
+      };
+      es.onerror = () => {
+        es.close();
+        $("send").disabled = false;
+      };
+    }
+
+    $("send").onclick = send;
+    $("msg").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+  </script>
+</body>
+</html>

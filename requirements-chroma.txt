@@ -1,0 +1,13 @@
+# 可选的向量存储后端：设 CORTEX_MEMORY_STORE=chroma 启用。
+#
+# 单独一个文件是为了让 requirements.txt 保持「零重量级依赖」——
+# 不装这个文件，默认的 JSON 后端照样跑（chromadb 是惰性 import 的）。
+#
+# 它体量不小：会拉进 onnxruntime / grpcio / kubernetes / opentelemetry 等
+# 约 30 个传递依赖、50MB+。Docker 镜像装的就是这个文件。
+#
+# 用 == 而不是 >=：容器可能要直接打开本地迁移过去的 chroma sqlite 文件，
+# 跨 minor 版本的 schema 差异会让它打不开；而打不开是**静默降级**回 JSON，
+# 现象是「记忆好像没迁上去」，极难排查。锁死版本让两边格式一致。
+-r requirements.txt
+chromadb==1.5.9

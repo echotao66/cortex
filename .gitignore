@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# 密钥与本地状态
+.env
+.cortex/
+.cortex-cli/
+
+# docker compose 的记忆落盘目录（在服务器上是真实数据，不进版本库）
+/data/
+
+# 迁移脚本写盘前的备份
+*.json.bak
+
+# IDE 配置（PyCharm 自己的 .idea/.gitignore 只挡住了 workspace.xml）
+.idea/
+
+# 演示/临时产物
+demo_result.txt
+mcp_smoke.txt
+# 下面两个是测试 Agent 的 write_file 工具时留下的，不是项目源码
+valorant_praise.txt
+地址1.txt

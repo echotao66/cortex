@@ -1,0 +1,18 @@
+openai==2.26.0
+langchain==1.2.12
+langchain-core==1.2.18
+langchain-openai==1.1.11
+langchain-deepseek==1.0.1
+numpy>=1.24
+fastapi>=0.110
+uvicorn>=0.29
+# 必须 >=2：agent/mcp/server.py 用的是 mcp.server.mcpserver.MCPServer，
+# 这个路径只在 mcp 2.x 存在（1.x 是 mcp.server.fastmcp.FastMCP）。
+# 约束放宽到 >=1.0 的话，解析到 1.x 时 MCP server 会 import 失败，
+# 而 Agent 侧是静默降级——现象只是「MCP 工具凭空消失」，很难查。
+mcp>=2.0,<3
+pytest>=8.0
+
+# 注意：chromadb 不在这里，它是可选依赖，见 requirements-chroma.txt。
+# 这样「不装 chromadb 也能跑默认 JSON 后端」才是一句真话。
+
