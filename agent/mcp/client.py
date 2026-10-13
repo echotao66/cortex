@@ -152,6 +152,7 @@ class MCPClient:
             fn=fn,
         )
         tool.cacheable = False  # 远程工具有外部副作用，不缓存
+        tool.requires_approval = True  # 远程工具越过了本进程的沙箱，风险更高
         return tool
 
 

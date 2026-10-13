@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -45,6 +48,9 @@ class Tool:
         self.parameters = parameters  # JSON Schema，根类型必须是 object
         self.fn = fn
         self.cacheable = True  # 幂等工具可缓存结果；有副作用的工具置 False
+        # 工具自己声明「我可能需要人工确认」。由 ApprovalPolicy 决定是否真的拦，
+        # 工具只管报风险、不决定策略 —— 策略要能统一配置，不能散在各个工具里。
+        self.requires_approval = False
 
     def to_openai_schema(self) -> dict[str, Any]:
         """转成 OpenAI/DeepSeek function calling 的 tools 元素。"""
@@ -58,14 +64,23 @@ class Tool:
         }
 
     def run(self, args: dict[str, Any], context: ToolContext) -> ToolResult:
-        """执行工具；任何异常都兜底成失败的 ToolResult，不让异常打断主循环。"""
+        """执行工具；异常兜底成失败的 ToolResult，不让异常打断主循环。
+
+        兜底不等于静默：异常类型进 metadata 并打日志。否则「工具代码有 bug」
+        和「工具正常返回了失败」在事件流里长得完全一样，排查时无从下手。
+        """
         try:
             result = self.fn(args, context)
             if isinstance(result, ToolResult):
                 return result
             return ToolResult(output=str(result))
         except Exception as exc:  # noqa: BLE001
-            return ToolResult(output=f"工具执行失败：{exc}", success=False)
+            logger.exception("工具 %s 抛出异常", self.name)
+            return ToolResult(
+                output=f"工具执行失败：{exc}",
+                success=False,
+                metadata={"exception": type(exc).__name__, "tool": self.name},
+            )
 
 
 def tool(

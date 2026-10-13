@@ -24,7 +24,7 @@
 ### 1. 确认敏感文件不会被提交
 
 ```bash
-cd /e/agent-project/cortex
+cd /path/to/cortex
 git init
 git add -A
 git status --short | grep -E "\.env|cortex/"    # 应当只出现 .env.example
@@ -136,10 +136,26 @@ DEEPSEEK_API_KEY=sk-你的真实key
 CORTEX_PORT=8000
 CORTEX_AUTH_USER=cortex
 CORTEX_AUTH_HASH=粘贴上一步的整串
+
+# --- 运行预算（都可选，不设=不设限）---
+# CORTEX_RUN_TIMEOUT=120       # 单次运行墙上时间上限（秒），不含等审批的时间
+# CORTEX_MAX_TOKENS=50000      # 单次运行 token 上限（需 LLM 接口返回 usage 才生效）
+
+# --- 成本核算（可选，两个都配才算钱）---
+# 单位：元 / 百万 token
+# CORTEX_PRICE_IN=2.0
+# CORTEX_PRICE_OUT=8.0
+
+# --- 审批闸门 ---
+# 默认**开启**：write_file / run_command 执行前挂起等人点批准。
+# CORTEX_APPROVAL=0            # 显式关掉（恢复「全部自动执行」的老行为）
+# CORTEX_APPROVAL_SKIP=run_command   # 白名单：这些工具自动放行，不弹审批
 EOF
 
 chmod 600 .env
 ```
+
+> `CORTEX_APPROVAL` 在本机跑 `run.bat` 时也是默认开的，所以本地和服务器行为一致。
 
 注意是 `<<'EOF'`（带引号）：不带引号的话 shell 会把哈希里的 `$2a` 当变量展开，哈希就废了。
 
@@ -172,7 +188,7 @@ mkdir -p /opt/cortex/data
 在**本地**把记忆传上去：
 
 ```bash
-scp -r E:/agent-project/cortex/.cortex/* root@<公网IP>:/opt/cortex/data/
+scp -r /path/to/cortex/.cortex/* root@<公网IP>:/opt/cortex/data/
 ```
 
 回到服务器改属主——**这一步不能省**：

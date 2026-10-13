@@ -13,6 +13,12 @@ read_file.cacheable = False   # 文件可能被修改，不缓存
 write_file.cacheable = False  # 有写副作用，不缓存
 run_command.cacheable = False  # 命令输出有时效，不缓存
 
+# 风险声明：写盘与执行命令不可逆、且能改动真实环境，声明为「可能需人工确认」。
+# 只读工具（calculator / read_file / list_directory）不声明 —— 审批不该滥用到
+# 读操作上，否则每次对话都要点确认，人就不看了，审批也就失效了。
+write_file.requires_approval = True
+run_command.requires_approval = True
+
 ALL_TOOLS = [calculator, read_file, write_file, run_command]
 
 

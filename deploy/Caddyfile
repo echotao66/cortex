@@ -24,6 +24,20 @@
 		# 在浏览器上就变成「整段回答一次性蹦出来」——页面看着还正常，
 		# 但整个透明/流式的卖点没了，而且很难意识到是这个配置的问题。
 		flush_interval -1
+
+		# 把「已通过 Basic 鉴权的用户名」注入请求头，供后端做审批审计留痕
+		#（backend/main.py 的 _actor() 读它，落到 approval_decided 事件里）。
+		#
+		# 为什么由反代注入而不是后端自己解析 Authorization 头：凭据的校验
+		# 已经在这里做完了，后端再解一遍不仅重复，还得自己实现 Basic 的
+		# 解码与比对 —— 一份判断两处实现，早晚会分叉。这里 Caddy 校验通过后
+		# 才把 {http.auth.user.id} 顶出来，后端拿到的是**已被本地反代核实过**
+		# 的身份。前提是 cortex 容器不直接对外暴露端口（compose 里只有
+		# expose，没有 ports），否则绕过反代就能伪造这个头。
+		#
+		# 注意每个请求都要显式 header_up：Caddy 不会默认透传客户端自带的
+		# X-Cortex-Actor，所以外面伪造的同名头在反代这一层就被丢掉了。
+		header_up X-Cortex-Actor {http.auth.user.id}
 	}
 }
 

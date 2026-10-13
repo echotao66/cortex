@@ -1,13 +1,21 @@
-# Cortex · 透明 AI 助手
+# Cortex · Agent 受控执行运行时
 
-一个**可观察**的 AI Agent：把「记忆」「工具调用」「MCP」「前后端」串成一个完整项目。它的独特之处不是"能聊天"，而是**你能看到 Agent 每一步在做什么**——回忆了什么记忆、调了什么工具、怎么固化成事实，而不是只有一个冷冰冰的回答。
+把「决定」与「执行」拆开的 Agent 执行运行时。它回答的是上线前绕不开的那个问题：**LLM 有了 shell 与文件写权限，凭什么敢让它跑？**
 
-灵感来自 [picoagents](https://github.com/borhen68/picoagents) 的 dual-memory + tool 设计，核心循环手写；LLM 层通过 LangChain 的 `ChatDeepSeek`（`langchain-deepseek`）接入 DeepSeek。
+工具调用、审批裁决、checkpoint、审计留痕、预算截停**全部手写**（仅 LLM 客户端接入 LangChain 官方 DeepSeek 集成）。附一个内部运维助手作为参考实现：读配置（只读工具直接放行）→ 产出结论（写操作被闸门拦下，人点头才落地）。
+
+它不只是「能聊天」——**每次执行在盘上都是一条有身份、有状态、可恢复、可审计的记录**：回忆了什么记忆、调了什么工具、被谁批准、花了多少 token，都能查、能回放、能接着跑。
+
+灵感来自 [picoagents](https://github.com/borhen68/picoagents) 的 dual-memory + tool 设计。
 
 ## 核心能力
 
 | 能力 | 实现 | 位置 |
 |------|------|------|
+| **执行运行时** | 状态机 + 可序列化快照 + 逐步骤 checkpoint，断点恢复 / 三档中断重放 / 预算截停 | `agent/runtime/` |
+| **人工审批闸门** | 工具声明风险 / 策略决定拦截；命中即挂起，人裁决后接着跑 | `agent/runtime/approval.py` |
+| **审批审计** | 每次裁决写 append-only 事件日志（谁、何时、批了什么），身份由反代注入 | `agent/runtime/kernel.py` |
+| **运行指标** | 状态分布 / 拦截率 / 工具失败率 / 审批等待 / token / 成本 | `GET /api/metrics` |
 | **短期记忆** | 按 `session_id` 缓存近期对话历史，注入上下文，保留最近 N 轮 | `agent/agent.py` |
 | **长期记忆** | `VectorMemory`（余弦相似度 × 指数时间衰减）+ `FactStore`（三元组冲突合并）+ LLM 固化 | `agent/memory/` |
 | **工具** | `@tool` 装饰器 + 手写 JSON Schema 校验 + 失败自动重试 + 结果缓存 + 沙箱 | `agent/tools/` |
@@ -33,17 +41,28 @@ flowchart LR
   ├─ 1. 检索长期记忆（余弦 × 时间衰减）      → memory_recalled
   ├─ 2. 注入 system prompt + 本会话短期记忆（历史对话）
   ├─ 3. ReAct 循环：调工具 → 拿结果 → 再决定 → tool_called / tool_result
+  │      └─ 命中审批策略：挂起等人工裁决     → approval_required
+  │           （裁决后由 POST …/approve|reject 接着跑）
+  │                                          → approval_decided
   ├─ 4. 得到最终回答                          → final_answer
   ├─ 5. 记录短期记忆（最近 N 轮）
   └─ 6. 固化长期记忆：提取事实 + 摘要         → fact_extracted
 ```
+
+每一步前后都落一次 checkpoint（`dispatched=False/True` 两段标记把「工具一定没跑」和「工具可能跑过了」分开），所以第 3 步中途断流/被杀也能按盘上的状态接着跑。
 
 ## 目录结构
 
 ```
 cortex/
 ├── agent/                 # Agent 核心（纯 Python，可独立用）
-│   ├── agent.py           # 核心 Agent：记忆+工具+MCP 串成事件流
+│   ├── agent.py           # 能力层：记忆+工具+MCP，串成事件流
+│   ├── runtime/           # 调度层：状态机 / 快照 / 落盘 / 预算 / 审批策略
+│   │   ├── kernel.py      #   AgentKernel：主循环、checkpoint、挂起与恢复、审计
+│   │   ├── state.py       #   RunState：可无损 JSON 化的运行快照
+│   │   ├── store.py       #   RunStore：原子写快照 + 只追加事件日志 + 原子抢占
+│   │   ├── budget.py      #   Budget：步数 / 墙上时间 / token 三个维度
+│   │   └── approval.py    #   ApprovalPolicy：拦不拦、拦哪些
 │   ├── events.py          # 结构化事件（透明展示）
 │   ├── llm.py             # DeepSeek 客户端（LangChain ChatDeepSeek，chat + function calling）
 │   ├── memory/            # 记忆子系统（向量/事实/固化）
@@ -108,7 +127,7 @@ python migrate_memory.py --rewrite-json   # 只重算 JSON 里的向量（不切
 ## 快速开始
 
 ```bash
-cd E:\agent-project\cortex
+cd cortex
 pip install -r requirements.txt
 
 # 1) 配置 DeepSeek key
@@ -139,10 +158,13 @@ python demo.py
 python -m pytest -v
 ```
 
-测试用脚本化的 `ScriptedLLM` 模拟多轮 function calling，**不联网、不花钱**，覆盖：记忆召回、工具调用、参数失败兜底、固化提取事实、MCP 客户端、沙箱安全边界。
+测试用脚本化的 `ScriptedLLM` 模拟多轮 function call，**不联网、不花钱**，覆盖：记忆召回、工具调用、参数失败兜底、固化提取事实、MCP 客户端、沙箱安全边界，以及**checkpoint 与断点恢复 / 三档中断重放 / 预算截停（含 token 维度）/ 审批挂起与裁决 / 审批审计与 actor 留痕 / 并发抢占 / 消息配对不变量**。
 
 > 必须用 `python -m pytest`，裸 `pytest` 会 `ModuleNotFoundError: agent`
 >（项目里没有 `conftest.py` / `pyproject.toml`，裸跑时 pytest 不会把项目根放进 `sys.path`）。
+>
+> 两个 benchmark 脚本（`benchmark_memory.py` / `benchmark_validation.py`）需要语义模型，普通跑测时忽略它们：
+> `pytest tests/ -q --ignore=tests/benchmark_memory.py --ignore=tests/benchmark_validation.py`
 
 ## 部署到服务器
 
@@ -169,6 +191,26 @@ python -m pytest -v
 - **MCP**：`mcp` SDK（客户端 + 自写文件系统 server，stdio 传输）
 - **向量检索**：numpy 手写（零向量库依赖，可插拔 `Embedder`）；可选 chromadb（HNSW + 持久化）
 - **可观测/流式**：结构化事件流（`AgentEvent`）→ SSE → 前端实时渲染；最终回答逐 token 推送（`answer_delta`）
+- **运行可查询**：`GET /api/runs?status=` / `GET /api/runs/{id}` / `…/events?after_seq=` / `GET /api/metrics`
+
+## 运行时速查
+
+运行记录落在 `.cortex/runs/`：`<run_id>.json` 是原子写的快照，`<run_id>.jsonl` 是只追加的事件日志。
+
+```bash
+GET  /api/runs?status=awaiting_approval   # 捞出所有卡在审批的运行（摘要带 pending_tool / decided_by）
+GET  /api/runs/{id}                       # 单次运行完整快照（含 messages / decisions / 成本）
+GET  /api/runs/{id}/events?after_seq=N    # 事件回放，seq 连续，支持断线续传
+POST /api/runs/{id}/approve | /reject     # 裁决（POST：批准会让工具真的执行，有副作用）
+GET  /api/metrics                         # 整体指标：拦截率 / 工具失败率 / token / 成本
+```
+
+| 现象 | 查什么 |
+|---|---|
+| 没动静也不回答 | `status`：`awaiting_approval` = 卡在审批（`pending_tool` 告诉你哪个工具）；`running` = 驱动它的连接没了，可直接 resume |
+| 回答像被截断 | `stop_reason`：`max_steps` / `timeout` / `max_tokens` / `rejected` vs `null`（自然收敛） |
+| 工具执行失败 | 那条 `tool_result` 的 `success` + `metadata`：**工具抛异常**还是**工具正常返回了失败** |
+| 谁放行的 | `decisions` / `decided_by`，或事件流里的 `approval_decided`（权威审计） |
 
 ## 面试可讲的点
 
@@ -178,6 +220,8 @@ python -m pytest -v
 4. **MCP 集成**：为什么走 MCP 而不是直接 import——工具可以跨语言、跨进程、标准化；这里 MCP 是 async 协议、主循环是同步的，讲清楚如何用「后台 event loop + 常驻协程」桥接。
 5. **透明/可观测**：Agent 的每次决策都是事件，前端能看到完整推理链，这对调试和信任都很关键。
 6. **短期 vs 长期记忆**：紧邻追问靠短期记忆（会话历史直接进上下文，精确、零成本），跨会话的偏好/事实靠长期记忆（固化后向量召回，有取舍地提炼）；两者各管一段，不能互相替代。
+7. **受控执行**：为什么审批要「决定与执行分离」（工具只声明风险、策略决定拦不拦）、为什么「等人批准」和「进程被杀」恢复语义完全相反、并发 approve 的窗口有多宽（`claim()` 原子抢占）、为什么 reject 也必须回填 tool 消息。详见 `RESUME-v2.md` 的自查清单。
+8. **成本与审计**：token 用量为什么要显式开 `stream_usage=True`（否则流式路径拿不到用量，而演示走的正是流式）、为什么拿不到用量坚决不补 0、单价为什么放装配层而不是 `RunState` 里。
 7. **一个自己找出来并修掉的 bug**：`HashEmbedder` 原本用内置 `hash()` 取哈希桶，而 CPython 对 `str` 的 `hash()` 会被 `PYTHONHASHSEED` 加盐——**跨进程不一致**。后果是「写盘那个进程存的向量」和「新进程算出的 query 向量」落在两个不相干的哈希空间里，余弦相似度退化成噪声，落盘的记忆再也检索不到（实测 40 条里 0 条自相似度超过 0.9）。改用 `zlib.crc32` 后跨进程恒定。**这类 bug 不会报错、不会崩，只会让检索"看起来在跑但结果全是随机的"**——所以加了跨进程的回归测试锁死算法。
 8. **换向量库时怎么保住行为契约**：两套后端跑同一套断言（`tests/test_memory_backends.py`）。难点是 chroma 的 HNSW 只按距离排序，而这里的语义是「余弦 × 时间衰减」——直接取距离最近的 k 条会漏掉「余弦略低但更新」的记忆。解法是**扩容 + 剪枝**：未取回的项得分 ≤ 其余弦 ≤ 已取回里最差的余弦，所以只要第 k 名的得分不低于它就能安全停止，结果与全量重排可证明等价（最坏退化成全量扫描，不比 numpy 版更差）。
 9. **部署前自己找出并修掉一个会泄露 API key 的漏洞**：`read_file` 的沙箱只校验「路径没越界」，

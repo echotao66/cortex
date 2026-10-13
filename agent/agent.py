@@ -1,4 +1,4 @@
-"""Cortex Agent：把记忆、工具、MCP 串成一条可观察的执行链路。
+"""Cortex Agent：把记忆、工具、MCP 串成一条可观察、可恢复的执行链路。
 
 一次 run 的完整流程（每个环节都产出事件，供前端「透明」展示）：
 
@@ -10,6 +10,10 @@
       ▼  4. 记录短期记忆 + 固化长期记忆（提取事实 + 摘要）
     最终回答
 
+循环本身不在这里了 —— 搬到了 agent/runtime/kernel.py 的 AgentKernel，
+由它负责 checkpoint / 预算 / 中断恢复。本类只保留「能力」：
+检索记忆、组装 prompt、执行工具、固化记忆；循环的「调度」交给 runtime。
+
 对外两个入口：
 - run_events(...) -> Iterator[AgentEvent] ：逐事件产出（后端 SSE 用）
 - run(...) -> str                           ：只返回最终回答（CLI 用）
@@ -18,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Iterator
@@ -26,31 +31,30 @@ from .events import (
     AgentEvent,
     FINAL_ANSWER,
     ERROR,
-    answer_delta,
     fact_extracted,
-    final_answer,
-    memory_recalled,
-    tool_called,
-    tool_result,
-    error,
 )
 from .llm import LLMClient, ToolCall
 from .memory.embedding import Embedder, HashEmbedder
 from .memory.engine import MemoryEngine
 from .memory.vector_memory import VectorMemory
 from .mcp.client import MCPClient
+from .runtime import AgentKernel, ApprovalPolicy, Budget, RunStore
 from .tools.base import ToolContext, ToolResult
 from .tools.builtin import build_default_registry
 from .tools.registry import ToolRegistry
 
-SYSTEM_PROMPT = """你是 Cortex，一个透明 AI 助手：会调用工具完成任务，也会在对话中记住用户的信息。
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """你是 Cortex 里的运维助手：通过调用工具帮用户排查和处理这台机器上的实际问题（看目录、读配置、算数值、改文件、跑命令），也会在对话中记住用户的信息。
 
 工具使用规则：
 1. 先判断是否需要调用工具；需要就调用，并把结果用于下一步。
-2. 需要多个工具协作时一步步来：调用一个 → 看结果 → 决定是否调用下一个。
+2. 需要多个工具协作时一步步来：调用一个 → 看结果 → 决定是否调用下一个。只读操作（看目录 / 读文件）可以直接做；写操作（写文件 / 跑命令）请先说清楚你要改什么、为什么改，再调用。
 3. 调用前确保参数符合要求；收到「参数校验失败」提示时，按提示修正参数再试一次。
 4. 已经拿到足够信息、或不需要工具时，直接给出最终回答，不要重复调用工具。
 5. 回答用简洁的中文。
+
+关于人工审批：写入 / 执行类操作在真正落地前会由人工确认。如果收到「用户拒绝执行工具 X」的回填，那就是**这事没做**——不要重试同一个调用，换个方式或直接说明情况后给结论；也不要把「被拒绝」描述成「已执行」。
 """
 
 
@@ -67,13 +71,25 @@ class Agent:
         mcp_client: MCPClient | None = None,
         workspace_root: str = ".",
         max_steps: int = 6,
+        max_seconds: float | None = None,
+        max_tokens: int | None = None,
         enable_memory: bool = True,
         max_history: int = 8,
+        run_store: RunStore | None = None,
+        approval_policy: ApprovalPolicy | None = None,
     ) -> None:
         self.llm = llm
         self.embedder = embedder or HashEmbedder()
         self.workspace_root = workspace_root
         self.max_steps = max_steps
+        # 不传 run_store 就不落盘（单测 / 库调用方不该被写文件打扰）
+        self.run_store = run_store
+        self.budget = Budget(
+            max_steps=max_steps, max_seconds=max_seconds, max_tokens=max_tokens
+        )
+        # 默认关闸：审批是「上线时按环境打开」的策略，不是库的默认行为。
+        # 演示 / 生产在装配点（backend/main.py）按 CORTEX_APPROVAL 显式打开。
+        self.approval_policy = approval_policy or ApprovalPolicy.disabled()
 
         # 是否支持流式输出：真实 LLMClient 有 stream_chat_with_tools，脚本化 LLM 没有
         self._streaming = hasattr(llm, "stream_chat_with_tools")
@@ -119,81 +135,26 @@ class Agent:
     def run_events(
         self, user_message: str, session_id: str | None = None
     ) -> Iterator[AgentEvent]:
-        """逐事件产出本轮执行过程（后端 SSE 用）。"""
-        session_id = session_id or "default"
-        context = ToolContext(workspace_root=self.workspace_root, session_id=session_id)
+        """逐事件产出本轮执行过程（后端 SSE 用）。
 
-        # 1. 检索相关长期记忆
-        recalled = self._recall(user_message)
-        if recalled:
-            yield memory_recalled(recalled)
+        循环本体在 AgentKernel 里；这里只是按当前配置装配一个 kernel。
+        """
+        return self.kernel().run_events(user_message, session_id=session_id)
 
-        # 2. 组装 messages（长期记忆注入 system prompt，短期记忆作为历史插在中间）
-        history = self._history.get(session_id, [])
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._build_system_prompt(recalled)},
-            *history,
-            {"role": "user", "content": user_message},
-        ]
-
-        # 3. ReAct 循环
-        final: str | None = None
-        steps = 0
-        while steps < self.max_steps:
-            try:
-                if self._streaming:
-                    # 流式：最终回答逐 token 产出 answer_delta，同时聚合工具调用
-                    parts: list[str] = []
-                    tool_calls: list[ToolCall] = []
-                    for piece in self.llm.stream_chat_with_tools(
-                        messages, self.registry.openai_schemas()
-                    ):
-                        if piece["type"] == "delta":
-                            parts.append(piece["content"])
-                            yield answer_delta(piece["content"])
-                        else:  # "tool_calls"
-                            tool_calls = piece["tool_calls"]
-                    resp = {
-                        "content": "".join(parts) or None,
-                        "tool_calls": tool_calls,
-                    }
-                else:
-                    resp = self.llm.chat_with_tools(
-                        messages, self.registry.openai_schemas()
-                    )
-            except Exception as exc:  # noqa: BLE001 —— 网络/鉴权错误兜底
-                yield error(f"LLM 调用失败：{exc}")
-                return
-
-            if not resp["tool_calls"]:
-                final = resp["content"] or ""
-                break
-
-            messages.append(self._assistant_message(resp))
-            for tc in resp["tool_calls"]:
-                yield tool_called(tc.name, tc.arguments)
-                result = self._execute(tc.name, tc.arguments, context)
-                yield tool_result(tc.name, result.success, result.output)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result.output,
-                    }
-                )
-                steps += 1
-
-        if final is None:
-            final = "已达到最大执行步数，任务未完成。"
-
-        yield final_answer(final)
-
-        # 4. 记录短期记忆（只保留最近若干轮）
-        self._remember(session_id, user_message, final)
-
-        # 5. 固化长期记忆（失败静默，不打断主流程）
-        if self.enable_consolidation:
-            yield from self._consolidate(user_message, final)
+    def kernel(
+        self,
+        *,
+        store: RunStore | None = None,
+        budget: Budget | None = None,
+        policy: ApprovalPolicy | None = None,
+    ) -> AgentKernel:
+        """装配一个执行内核。store / policy 缺省用实例上的。"""
+        return AgentKernel(
+            self,
+            store=store if store is not None else self.run_store,
+            budget=budget or self.budget,
+            policy=policy if policy is not None else self.approval_policy,
+        )
 
     # ---- 内部环节 ----
 
@@ -233,13 +194,30 @@ class Agent:
     def _execute(
         self, name: str, arguments: dict[str, Any], context: ToolContext
     ) -> ToolResult:
-        """执行单个工具；模型幻觉出不存在的工具时返回友好错误而非抛异常。"""
+        """执行单个工具。**任何异常都收敛成失败的 ToolResult，绝不向上抛。**
+
+        工具的异常有两道兜底，这里是第二道：
+        1. Tool.run() 内部兜住工具函数自身的异常；
+        2. 这里兜住它外面的（注册表查找、参数校验、缓存读写、MCP 传输）。
+
+        为什么要收敛而不是抛出：一次工具失败不该炸掉整轮对话 —— 失败的
+        结果回填给模型，它自己会决定重试还是换路。但这不等于可以静默：
+        异常类型要进 metadata 并打日志，否则「工具坏了」和「工具正常返回
+        了失败」在事件流里长得一模一样。
+        """
         try:
             return self.registry.run(name, arguments, context)
         except KeyError:
             return ToolResult(
                 output=f"不存在工具「{name}」，请从可用工具中重新选择",
                 success=False,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 见上：收敛，但不静默
+            logger.exception("工具 %s 执行路径抛异常", name)
+            return ToolResult(
+                output=f"工具「{name}」执行异常（{type(exc).__name__}）：{exc}",
+                success=False,
+                metadata={"exception": type(exc).__name__, "tool": name},
             )
 
     def _consolidate(self, user: str, assistant: str) -> Iterator[AgentEvent]:
@@ -276,6 +254,9 @@ def build_agent(
     mcp_command: str | None = None,
     mcp_args: list[str] | None = None,
     workspace_root: str = ".",
+    run_store: RunStore | None = None,
+    max_seconds: float | None = None,
+    max_tokens: int | None = None,
     **kwargs: Any,
 ) -> Agent:
     """便捷工厂：可选加载 MCP server；连接失败则降级为纯内置工具（不崩）。
@@ -309,5 +290,8 @@ def build_agent(
         vector_memory=vector_memory,
         mcp_client=mcp_client,
         workspace_root=workspace_root,
+        run_store=run_store,
+        max_seconds=max_seconds,
+        max_tokens=max_tokens,
         **kwargs,
     )

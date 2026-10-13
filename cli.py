@@ -107,7 +107,7 @@ def main() -> None:
         if n:
             print(f"已加载 {n} 条历史记忆（含事实）\n")
 
-    print("Cortex 透明 AI 助手 —— 输入消息开始对话，输入 /exit 退出\n")
+    print("Cortex Agent 受控执行运行时 —— 输入消息开始对话，输入 /exit 退出\n")
     while True:
         try:
             user_input = input("你 > ").strip()

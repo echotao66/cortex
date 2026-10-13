@@ -40,6 +40,25 @@ class ToolCall:
     arguments: dict[str, Any]
 
 
+def _usage_of(message: Any) -> dict[str, int] | None:
+    """把 LangChain 的 usage_metadata 规整成 {"input_tokens", "output_tokens"}。
+
+    LangChain 各个 provider 的 usage 字段名不完全一样（input_tokens / output_tokens
+    是统一层给的，原始 provider 字段可能叫 prompt_tokens / completion_tokens），
+    这里只读统一层，避免每个 provider 写一份适配。
+
+    拿不到时返回 None 而不是 0：**0 和「不知道」在成本核算里是两回事** ——
+    补 0 会让 token 预算永远不超、让成本报表看起来像免费的。
+    """
+    usage = getattr(message, "usage_metadata", None)
+    if not usage:
+        return None
+    return {
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+    }
+
+
 class LLMClient:
     """支持 function calling 的 DeepSeek 客户端（LangChain ChatDeepSeek 实现）。
 
@@ -55,10 +74,14 @@ class LLMClient:
                 "缺少 DEEPSEEK_API_KEY：请设置环境变量，或 LLMConfig(api_key=...) 传入"
             )
         # ChatDeepSeek 是 LangChain 官方 DeepSeek 集成，api_base 默认指向 DeepSeek。
+        # stream_usage=True：让流式请求也带上 token 用量（底层是 OpenAI 兼容的
+        # stream_options.include_usage）。不显式打开的话，流式调用拿不到 usage，
+        # token 预算就只能对非流式生效 —— 而 Web 演示走的正是流式，等于没做。
         self._model = ChatDeepSeek(
             api_key=api_key,
             api_base=config.base_url,
             model=config.model,
+            stream_usage=True,
         )
         self.model = config.model
 
@@ -83,9 +106,11 @@ class LLMClient:
         *,
         temperature: float = 0.0,
     ) -> dict[str, Any]:
-        """一轮带工具对话。返回 {"content": str|None, "tool_calls": [ToolCall, ...]}。
+        """一轮带工具对话。返回 {"content", "tool_calls", "usage"}。
 
         content 与 tool_calls 二选一：模型要么继续调用工具，要么给出最终回答。
+        usage 是这一轮的 token 用量（算钱的依据），拿不到时为 None ——
+        **不猜也不补 0**，宁可让上层看到「未知」，也不要让它以为花了 0 token。
         """
         lc_messages = convert_to_messages(messages)
         resp = self._model.bind_tools(tools, tool_choice="auto").invoke(
@@ -100,7 +125,11 @@ class LLMClient:
         content = self._text(resp.content)
         if content == "":
             content = None
-        return {"content": content, "tool_calls": tool_calls}
+        return {
+            "content": content,
+            "tool_calls": tool_calls,
+            "usage": _usage_of(resp),
+        }
 
     def stream_chat_with_tools(
         self,
@@ -112,6 +141,7 @@ class LLMClient:
         """流式带工具对话，逐块产出：
         - {"type": "delta", "content": str}           文本增量（最终回答逐 token）
         - {"type": "tool_calls", "tool_calls": [...]} 模型发起的工具调用（流结束后一次性产出）
+        - {"type": "usage", "usage": {...}}           token 用量（流结束后产出，可能没有）
 
         文本增量与工具调用二选一：纯回答只有 delta，调用工具只有 tool_calls。
         """
@@ -122,10 +152,15 @@ class LLMClient:
 
         # 工具调用按 index 聚合：流式下 name / arguments 是分片到达的
         slots: dict[int, dict[str, str]] = {}
+        # usage 只在流的**最后**一块里（include_usage 的语义），所以留最后一次非空值
+        usage: dict[str, int] | None = None
         for chunk in stream:
             content = self._text(chunk.content)
             if content:
                 yield {"type": "delta", "content": content}
+            piece_usage = _usage_of(chunk)
+            if piece_usage is not None:
+                usage = piece_usage
             for tc in chunk.tool_call_chunks:
                 idx = tc.get("index") or 0
                 slot = slots.setdefault(idx, {"id": "", "name": "", "args": ""})
@@ -147,6 +182,9 @@ class LLMClient:
                     ToolCall(id=slot["id"], name=slot["name"], arguments=arguments)
                 )
             yield {"type": "tool_calls", "tool_calls": tool_calls}
+
+        if usage is not None:
+            yield {"type": "usage", "usage": usage}
 
     @staticmethod
     def _text(content: Any) -> str:

@@ -18,6 +18,15 @@ services:
       CORTEX_MEMORY_STORE: ${CORTEX_MEMORY_STORE:-chroma}
       # 内置工具的 workspace_root 与 MCP 子进程的沙箱根，两者必须一致
       MCP_FS_ROOT: /app/cortex
+      # 运行预算与成本单价。`:?` 之外一律用 `:-` 给默认值：
+      # 这些是可选调参，没配就该走默认行为，而不是让服务起不来。
+      CORTEX_RUN_TIMEOUT: ${CORTEX_RUN_TIMEOUT:-}
+      CORTEX_MAX_TOKENS: ${CORTEX_MAX_TOKENS:-}
+      CORTEX_PRICE_IN: ${CORTEX_PRICE_IN:-}
+      CORTEX_PRICE_OUT: ${CORTEX_PRICE_OUT:-}
+      # 审批闸门默认开（backend 侧判断），这里只是把 .env 的选择透传进去。
+      CORTEX_APPROVAL: ${CORTEX_APPROVAL:-}
+      CORTEX_APPROVAL_SKIP: ${CORTEX_APPROVAL_SKIP:-}
     volumes:
       # 记忆落盘在宿主机上，容器重建/换镜像都不丢。
       # 注意：容器内是 uid 10001，宿主机上这个目录要 chown 10001:10001，

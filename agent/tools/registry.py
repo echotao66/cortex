@@ -8,11 +8,14 @@ run() 里先做 JSON Schema 校验（参数不合规就直接失败回填，不�
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
 from .base import Tool, ToolContext, ToolResult
 from .schema import validate_params
+
+logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
@@ -33,6 +36,10 @@ class ToolRegistry:
             raise KeyError(f"未知工具：{name}")
         return self._tools[name]
 
+    def find(self, name: str) -> Tool | None:
+        """查得到就返回，查不到返回 None（模型幻觉出的工具名不该炸在这里）。"""
+        return self._tools.get(name)
+
     def names(self) -> list[str]:
         return sorted(self._tools)
 
@@ -41,10 +48,23 @@ class ToolRegistry:
         return [t.to_openai_schema() for t in self._tools.values()]
 
     def run(self, name: str, args: dict[str, Any], context: ToolContext) -> ToolResult:
-        """执行工具：先校验参数，再查缓存，最后真正执行。"""
+        """执行工具：先校验参数，再查缓存，最后真正执行。
+
+        工具函数自身的异常由 Tool.run() 兜住；这里补的是它**外面**那一圈 ——
+        一个 schema 写错的工具会让 validate_params 直接抛，缓存键序列化失败
+        也会抛，这些如果在执行路径上裸奔，就会一路穿到主循环把整轮对话打断。
+        """
         tool = self.get(name)
 
-        errors = validate_params(args, tool.parameters)
+        try:
+            errors = validate_params(args, tool.parameters)
+        except Exception as exc:  # noqa: BLE001 —— schema 自身有问题
+            logger.exception("工具 %s 的参数校验内部出错", name)
+            return ToolResult(
+                output=f"工具「{name}」的参数校验内部错误（{type(exc).__name__}）：{exc}",
+                success=False,
+                metadata={"exception": type(exc).__name__, "tool": name},
+            )
         if errors:
             return ToolResult(
                 output=f"参数校验失败：{'；'.join(errors)}",

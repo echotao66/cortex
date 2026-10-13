@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Cortex · 透明 AI 助手</title>
+  <title>Cortex · Agent 受控执行运行时</title>
   <style>
     :root {
       --bg: #0f1117;
@@ -17,6 +17,7 @@
       --err: #f87171;
       --memory: #c084fc;
       --tool: #38bdf8;
+      --warn: #fbbf24;
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
@@ -91,6 +92,26 @@
     .tag.tool { color: var(--tool); }
     .tag.ok { color: var(--ok); }
     .tag.err { color: var(--err); }
+    .tag.warn { color: var(--warn); }
+
+    /* 审批卡片：闸门拦住一次工具调用时出现，必须给出「拦的是什么 + 为什么拦」，
+       否则「点批准」会退化成无脑操作，闸门等于没装 */
+    .approval { border-color: var(--warn); }
+    .approval .reason {
+      color: var(--warn); font-size: 12px; margin: 6px 0; padding: 6px 8px;
+      border-radius: 6px; background: rgba(251, 191, 36, .08);
+    }
+    .approval .btns { display: flex; gap: 8px; margin-top: 8px; }
+    .approval button {
+      flex: 1; padding: 6px 10px; border-radius: 6px; font-size: 12px;
+      cursor: pointer; background: var(--panel);
+      border: 1px solid var(--border); color: var(--text);
+    }
+    .approval button.ok { border-color: var(--ok); color: var(--ok); }
+    .approval button.no { border-color: var(--err); color: var(--err); }
+    .approval button:disabled { opacity: .5; cursor: default; }
+    .approval .verdict { font-size: 12px; margin-top: 8px; }
+    .runbar .warn { color: var(--warn); }
 
     .msg { padding: 10px 14px; border-radius: 10px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
     .msg.user { background: #26304a; align-self: flex-end; max-width: 85%; }
@@ -98,6 +119,14 @@
     .msg.error { background: #3a1f24; border: 1px solid var(--err); color: var(--err); }
 
     .score { color: var(--muted); font-size: 11px; }
+    /* 当前运行的 id + 状态：一次运行现在是有身份的，看得见才好排查 */
+    .runbar {
+      color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace;
+      padding: 4px 10px; min-height: 20px;
+      border-bottom: 1px solid rgba(128, 128, 128, .2);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .runbar .bad { color: #e5534b; }
     .mono { font-family: Consolas, monospace; font-size: 12px; }
     .empty { color: var(--muted); font-size: 12px; text-align: center; padding: 20px 0; }
 
@@ -139,7 +168,7 @@
 <body>
   <header>
     <h1>Cortex</h1>
-    <span>透明 AI 助手 —— 左看记忆、中看对话、右看工具</span>
+    <span>受控执行运行时 —— 记忆 / 工具 / 审批 / 审计，每一步都可查可恢复</span>
   </header>
 
   <main class="grid">
@@ -149,6 +178,7 @@
     </aside>
     <section class="col">
       <h2>💬 对话</h2>
+      <div class="runbar" id="runbar"></div>
       <div class="scroll" id="chat"></div>
     </section>
     <aside class="col">
@@ -158,7 +188,11 @@
   </main>
 
   <footer>
-    <input id="msg" placeholder="输入消息，回车发送…（试试：计算 123*456，或告诉我你的喜好）" />
+    <!-- 提示语就是一个能跑通的运维剧本：读配置（只读，直接放行）→
+         写一份结论回来（写操作，会被闸门拦下弹审批卡片）。
+         这样第一次打开页面的人不用想「该问什么」，一眼就能看到
+         「决定」和「执行」是分开的 —— 而这正是这个项目要讲的事。 -->
+    <input id="msg" placeholder="输入消息，回车发送…（试试：读一下 deploy/Caddyfile，把反代的关键配置整理成一份 deploy/caddy-notes.md）" />
     <button id="send">发送</button>
   </footer>
 
@@ -176,10 +210,15 @@
 
     let currentTool = null; // 串行执行：一个 tool_called 紧跟一个 tool_result
     let currentAnswer = null; // 流式输出中的助手气泡
+    let activeRunId = "";     // 当前展示的 run_id，审批裁决时要拿它拼端点
 
     function handle(evt) {
       const t = evt.type, p = evt.payload || {};
-      if (t === "memory_recalled") {
+      if (t === "run_started") {
+        const label = p.resumed ? "续跑" : "运行";
+        activeRunId = p.run_id;
+        $("runbar").innerHTML = `${label} <b>${esc(p.run_id)}</b>`;
+      } else if (t === "memory_recalled") {
         const html = p.items.map((i) =>
           `<div>· ${esc(i.text)} <span class="score">(${i.score})</span></div>`).join("");
         $("memory").appendChild(card(html, "memory"));
@@ -188,6 +227,8 @@
           `<div>· ${esc(f.subject)} ${esc(f.predicate)} ${esc(f.object)}</div>`).join("");
         const summary = p.summary ? `<div class="score">${esc(p.summary)}</div>` : "";
         if (facts || summary) $("memory").appendChild(card(facts + summary, "memory"));
+      } else if (t === "approval_required") {
+        $("tool").appendChild(approvalCard(p, activeRunId));
       } else if (t === "tool_called") {
         currentTool = card(
           `<div class="mono">${esc(p.name)}(<br>${esc(JSON.stringify(p.arguments, null, 1))})</div>
@@ -201,6 +242,17 @@
             (ok ? "✓ " : "✗ ") + esc(p.output || "");
         }
         currentTool = null;
+      } else if (t === "approval_decided") {
+        // 审计回执：谁批的。跟 approval_required 配对显示，
+        // 「拦下来了」和「谁放的」两件事在同一条时间线上。
+        const how = p.decision === "approve" ? "✓ 已批准" : "✗ 已拒绝";
+        const d = document.createElement("div");
+        d.className = "card";
+        d.innerHTML =
+          `<div class="tag ${p.decision === "approve" ? "ok" : "err"}">${how}</div>
+           <div><b>${esc(p.name)}</b> —— 审批人：${esc(p.actor || "unknown")}</div>
+           <div class="score">${esc(p.reason || "")}</div>`;
+        $("tool").appendChild(d);
       } else if (t === "answer_delta") {
         if (!currentAnswer) {
           currentAnswer = document.createElement("div");
@@ -217,14 +269,86 @@
           d.textContent = p.answer;
           $("chat").appendChild(d);
         }
+      } else if (t === "done") {
+        // 停在等审批的运行**不是**跑完了。不加这个标记，界面上「等审批」和
+        // 「答完了」长得一模一样，用户会以为它已经结束、然后奇怪为什么没动静。
+        if (p.paused) {
+          $("runbar").innerHTML +=
+            ` <span class="warn">· 等待人工审批（${esc(p.pending_tool || "?")}）</span>`;
+        } else {
+          showRunStats(p.run_id);
+        }
       } else if (t === "error") {
         const d = document.createElement("div");
         d.className = "msg error";
         d.textContent = "⚠ " + p.message;
         $("chat").appendChild(d);
+        const bar = $("runbar");
+        if (bar.textContent) bar.innerHTML += ' <span class="bad">· 已中止</span>';
       }
       // 各列自动滚到底
       [ $("chat"), $("memory"), $("tool") ].forEach((el) => { el.scrollTop = el.scrollHeight; });
+    }
+
+    // 审批卡片：工具名 + 参数 + 拦截理由 + 批准/拒绝。
+    // 理由必须展示 —— 不显示的话「点批准」会退化成无脑操作，闸门等于没装。
+    function approvalCard(p, runId) {
+      const d = document.createElement("div");
+      d.className = "card approval";
+      d.innerHTML =
+        `<div class="tag warn">⏸ 需要人工确认</div>
+         <div class="mono">${esc(p.name)}(<br>${esc(JSON.stringify(p.arguments, null, 1))})</div>
+         <div class="reason">${esc(p.reason || "")}</div>
+         <div class="btns">
+           <button class="ok">批准执行</button>
+           <button class="no">拒绝</button>
+         </div>`;
+
+      const decide = async (decision) => {
+        d.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+        d.querySelector(".btns").innerHTML =
+          decision === "approve"
+            ? '<span class="verdict" style="color:var(--ok)">✓ 已批准，继续执行…</span>'
+            : '<span class="verdict" style="color:var(--err)">✗ 已拒绝，交回模型处理…</span>';
+        // 裁决走 POST：它会让工具真的执行，是有副作用的决策。
+        // GET 会被浏览器预取、被中间层缓存、被日志原样记下 URL。
+        await consume(`/api/runs/${encodeURIComponent(runId)}/${decision}`, {
+          method: "POST",
+        });
+      };
+      d.querySelector("button.ok").onclick = () => decide("approve");
+      d.querySelector("button.no").onclick = () => decide("reject");
+      return d;
+    }
+
+    // 跑完之后把这次运行的「账单」贴到运行栏：几轮、多少 token、多少钱。
+    // 数据来自 GET /api/runs/{id}（快照 + 后端算的 cost），不在前端重算 ——
+    // 单价是后端的配置，前端自己算会多出一份迟早对不上的价格表。
+    async function showRunStats(runId) {
+      if (!runId) return;
+      const bar = $("runbar");
+      if (bar.dataset.stats === runId) return; // 续跑会再发一次 done，别贴两遍
+      try {
+        const r = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+        if (!r.ok) return;
+        const s = await r.json();
+        const bits = [`${s.step} 步`];
+        if (s.tool_calls) bits.push(`工具 ${s.tool_calls} 次`);
+        if (s.tokens_total) bits.push(`${s.tokens_total} tokens`);
+        if (s.cost != null) bits.push(`¥${Number(s.cost).toFixed(4)}`);
+        if (s.stop_reason) bits.push(`截停：${s.stop_reason}`);
+        bar.dataset.stats = runId;
+        bar.innerHTML += ` <span class="score">· ${esc(bits.join(" · "))}</span>`;
+      } catch (_) { /* 统计拿不到不影响主流程 */ }
+    }
+
+    // 后端在开流之前就拒了（404 没这个 run / 409 状态不对或已被别的请求抢占）
+    function notice(text) {
+      const d = document.createElement("div");
+      d.className = "card";
+      d.innerHTML = `<div class="tag err">✗ 审批未生效</div><div>${esc(text)}</div>`;
+      $("tool").appendChild(d);
+      $("tool").scrollTop = $("tool").scrollHeight;
     }
 
     // 每个标签页一条会话 id，随请求带给后端，用于隔离短期记忆。
@@ -241,7 +365,57 @@
     const SESSION_ID = sessionStorage.getItem("cortex_sid") || newSessionId();
     sessionStorage.setItem("cortex_sid", SESSION_ID);
 
-    function send() {
+    // 手写 SSE 读取器，替代 EventSource。
+    //
+    // 为什么不用 EventSource：它只能发 GET，而审批裁决必须是 POST ——
+    // 批准会让 write_file 真的落盘，这是有副作用的决策，走 GET 会被浏览器
+    // 预取、被中间层缓存、被日志原样记下 URL。fetch + ReadableStream 大约
+    // 二十行，换来的是「决策不经过任何可被自动触发/缓存的通道」。
+    async function streamSSE(url, opts = {}) {
+      const resp = await fetch(url, opts);
+      if (!resp.ok) {
+        let detail = `${resp.status} ${resp.statusText}`;
+        try { detail = (await resp.json()).detail || detail; } catch (_) {}
+        notice(detail);
+        return;
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        // SSE 帧以空行分隔。最后一段可能是半截帧（网络按块到达），
+        // 留在 buf 里等下一块 —— 直接 JSON.parse 半截 JSON 会丢掉事件。
+        const frames = buf.split("\n\n");
+        buf = frames.pop();
+        for (const frame of frames) {
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            let evt;
+            try { evt = JSON.parse(line.slice(6)); } catch (_) { continue; }
+            handle(evt);
+          }
+        }
+      }
+    }
+
+    // 消费一条流的公共收尾：断流不该让人以为运行丢了。
+    async function consume(url, opts) {
+      try {
+        await streamSSE(url, opts);
+      } catch (exc) {
+        // 流断了不等于这次运行丢了：后端在每个步骤都落了 checkpoint，
+        // 挂起的运行可以 POST /api/runs/{id}/approve|resume 接着跑。
+        const bar = $("runbar");
+        if (bar.textContent && !bar.querySelector(".bad")) {
+          bar.innerHTML += ' <span class="bad">· 连接断开（该运行已存盘，可从 /api/runs 恢复）</span>';
+        }
+      }
+    }
+
+    async function send() {
       const input = $("msg");
       const msg = input.value.trim();
       if (!msg) return;
@@ -256,20 +430,10 @@
 
       const url = "/api/chat/stream?message=" + encodeURIComponent(msg)
                 + "&session_id=" + encodeURIComponent(SESSION_ID);
-      const es = new EventSource(url);
-      es.onmessage = (e) => {
-        const evt = JSON.parse(e.data);
-        handle(evt);
-        if (evt.type === "done" || evt.type === "error") {
-          es.close();
-          $("send").disabled = false;
-          $("msg").focus();
-        }
-      };
-      es.onerror = () => {
-        es.close();
-        $("send").disabled = false;
-      };
+      await consume(url);
+      // 停等审批时照样解锁：运行挂在盘上，不阻塞开新的对话。
+      $("send").disabled = false;
+      $("msg").focus();
     }
 
     $("send").onclick = send;
